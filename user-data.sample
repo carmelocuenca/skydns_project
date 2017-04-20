@@ -1,43 +1,148 @@
 #cloud-config
 
+---
 coreos:
   etcd2:
-    #generate a new token for each unique cluster from https://discovery.etcd.io/new
-    #discovery: https://discovery.etcd.io/<token>
-    # multi-region and multi-cloud deployments need to use $public_ipv4
     advertise-client-urls: http://$public_ipv4:2379
     initial-advertise-peer-urls: http://$private_ipv4:2380
-    # listen on both the official ports and the legacy ports
-    # legacy ports can be omitted if your application doesn't depend on them
     listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
     listen-peer-urls: http://$private_ipv4:2380,http://$private_ipv4:7001
+    discovery: https://discovery.etcd.io/4f4f5695da70481d7a3d1611e4964c0a
   fleet:
-    public-ip: $public_ipv4
+    public-ip: "$public_ipv4"
   flannel:
-    interface: $public_ipv4
+    interface: "$public_ipv4"
   units:
-    - name: etcd2.service
-      command: start
-    - name: fleet.service
-      command: start
-    - name: flanneld.service
-      drop-ins:
-      - name: 50-network-config.conf
-        content: |
-          [Service]
-          ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{ "Network": "10.1.0.0/16" }'
-      command: start
-    - name: docker-tcp.socket
-      command: start
-      enable: true
+  - name: etcd2.service
+    command: start
+  - name: fleet.service
+    command: start
+  - name: flanneld.service
+    drop-ins:
+    - name: 50-network-config.conf
       content: |
-        [Unit]
-        Description=Docker Socket for the API
+        [Service]
+        ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{ "Network": "10.1.0.0/16" }'
+    command: start
+  - name: docker-tcp.socket
+    command: start
+    enable: true
+    content: |
+      [Unit]
+      Description=Docker Socket for the API
 
-        [Socket]
-        ListenStream=2375
-        Service=docker.service
-        BindIPv6Only=both
+      [Socket]
+      ListenStream=2375
+      Service=docker.service
+      BindIPv6Only=both
 
-        [Install]
-        WantedBy=sockets.target
+      [Install]
+      WantedBy=sockets.target
+  - name: postgresql.fleet.service
+    command: start
+    content: |
+      [Unit]
+      Description=A fleet postgresql unit
+
+      [Service]
+      ExecStartPre=/bin/sh -c "sleep 10"
+      ExecStart=/usr/bin/fleetctl start /home/core/postgresql.service
+  - name: skydns.fleet.service
+    command: start
+    content: |
+      [Unit]
+      Description=A fleet SkyDNS unit
+
+      [Service]
+      ExecStartPre=/bin/sh -c "sleep 10"
+      ExecStart=/usr/bin/fleetctl start /home/core/skydns.service
+  - name: ping.fleet.service
+    command: start
+    content: |
+      [Unit]
+      Description=A fleet ping unit
+
+      [Service]
+      ExecStartPre=/bin/sh -c "sleep 10"
+      ExecStart=/usr/bin/fleetctl start /home/core/ping.service
+write_files:
+- path: "/home/core/etc/postgres-credentials.env"
+  owner: core:core
+  permissions: '0644'
+  content: |
+    POSTGRES_USER=postgres
+    POSTGRES_PASSWORD=postgres
+- path: "/home/core/skydns.service"
+  owner: core:core
+  permissions: '0644'
+  content: |
+    [Unit]
+    Description=SkyDNS service
+    After=docker.service etcd2.service
+    Requires=docker.service etcd2.service
+
+    [Service]
+    TimeoutStartSec=0
+    ExecStartPre=-/usr/bin/docker kill some-dns
+    ExecStartPre=-/usr/bin/docker rm some-dns
+    ExecStartPre=/usr/bin/docker pull skynetservices/skydns
+    ExecStartPre=/usr/bin/etcdctl set /skydns/config \
+     '{"dns_addr":"0.0.0.0:53", "domain": "example.local.", "ttl":30}'
+    ExecStart=/usr/bin/docker run --rm --name some-dns \
+      -e ETCD_MACHINES="http://$public_ipv4:2379" \
+      skynetservices/skydns
+    ExecStop=/usr/bin/docker stop some-dns
+
+    [X-Fleet]
+    Global=true
+- path: "/home/core/ping.service"
+  owner: core:core
+  permissions: '0644'
+  content: |
+    [Unit]
+    Description=Ping service
+    After=docker.service skydns.service
+    Requires=docker.service skydns.service
+
+    [Service]
+    Restart=always
+    RestartSec=20s
+    TimeoutStartSec=0
+    ExecStartPre=-/usr/bin/docker kill some-ping
+    ExecStartPre=-/usr/bin/docker rm some-ping
+    ExecStartPre=/usr/bin/docker pull busybox
+    ExecStartPre=/bin/sh -c "sleep 10"
+    ExecStart=/bin/bash -c '\
+      /usr/bin/docker run --rm --name some-ping \
+      --dns $(/usr/bin/docker inspect --format "{{ .NetworkSettings.IPAddress }}" some-dns) \
+      busybox /bin/sh -c "while true; do /bin/ping -c 1 db.example.local; sleep 10; done"'
+    ExecStop=/usr/bin/docker stop some-ping
+
+    [X-Fleet]
+    Global=true
+- path: "/home/core/postgresql.service"
+  owner: core:core
+  permissions: '0644'
+  content: |
+    [Unit]
+    Description=PostgreSQL database
+    After=docker.service, etcd2.service
+    Requires=docker.service, etcd2.service
+
+    [Service]
+    TimeoutStartSec=0
+    EnvironmentFile=/home/core/etc/postgres-credentials.env
+    ExecStartPre=-/usr/bin/docker kill some-postgres
+    ExecStartPre=-/usr/bin/docker rm some-postgres
+    ExecStartPre=/usr/bin/docker pull postgres
+    ExecStart=/usr/bin/docker run --rm --name some-postgres \
+      -e "POSTGRES_USER=${POSTGRES_USER}" -e "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}" \
+      postgres
+    ExecStartPost=/bin/bash -c "sleep 10"
+    ExecStartPost=/bin/bash -c '\
+    /usr/bin/etcdctl set /skydns/local/example/db \
+    "{ \\"host\\":  \\"$(/usr/bin/docker inspect --format "{{ .NetworkSettings.IPAddress }}" some-postgres)\\" }"'
+    ExecStartPost=/usr/bin/etcdctl get /skydns/local/example/db
+    ExecStop=/usr/bin/docker stop some-postgres
+
+    [X-Fleet]
